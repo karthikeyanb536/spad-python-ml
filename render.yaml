@@ -1,0 +1,5 @@
+services:
+  - type: web
+    name: spad-python-ml
+    env: docker
+    healthCheckPath: /health
