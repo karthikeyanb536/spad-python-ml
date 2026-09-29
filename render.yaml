@@ -1,5 +1,6 @@
 services:
   - type: web
     name: spad-python-ml
-    env: docker
+    runtime: docker
+    plan: free
     healthCheckPath: /health
