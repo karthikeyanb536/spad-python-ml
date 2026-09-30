@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SPAD V4 Screening</title>
+  <style>
+    :root { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#172033; background:#f5f7fb; }
+    * { box-sizing:border-box; }
+    body { margin:0; }
+    .wrap { max-width:1200px; margin:0 auto; padding:28px 18px 60px; }
+    header, .panel, .card { background:#fff; border:1px solid #e2e7f0; border-radius:16px; box-shadow:0 5px 22px rgba(20,35,70,.05); }
+    header { padding:26px; }
+    h1 { margin:0 0 8px; font-size:30px; }
+    h2 { margin:0 0 12px; font-size:18px; }
+    .muted { color:#6e788d; }
+    .grid { display:grid; grid-template-columns:1.5fr 1fr 1fr; gap:14px; margin-top:20px; }
+    .field { padding:16px; border:1px solid #e2e7f0; border-radius:13px; background:#fff; }
+    label { display:block; font-weight:750; margin-bottom:8px; }
+    input { width:100%; font:inherit; }
+    input[type=file], input[type=text], input[type=number] { padding:11px; border:1px solid #cfd6e3; border-radius:10px; background:#fff; }
+    .help { margin-top:7px; font-size:12px; color:#7a8498; line-height:1.45; }
+    .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:16px; }
+    button { border:0; border-radius:10px; padding:12px 18px; font:inherit; font-weight:800; cursor:pointer; }
+    #runBtn { background:#172033; color:#fff; }
+    .secondary { background:#e9edf5; color:#172033; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .status { display:none; margin-top:15px; padding:12px 14px; border-radius:11px; background:#f0f3f8; white-space:pre-wrap; }
+    .status.show { display:block; }
+    .results { display:none; margin-top:20px; }
+    .results.show { display:block; }
+    .cards { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:14px; }
+    .card { padding:15px; }
+    .k { font-size:12px; color:#727d91; }
+    .v { margin-top:5px; font-size:22px; font-weight:850; word-break:break-word; }
+    .panel { padding:16px; margin-top:14px; overflow:auto; }
+    table { border-collapse:collapse; width:100%; min-width:1000px; }
+    th,td { padding:9px 10px; border-bottom:1px solid #edf0f5; text-align:left; font-size:13px; vertical-align:top; }
+    th { background:#fafbfe; position:sticky; top:0; }
+    .flag { font-weight:800; }
+    .ok { color:#1d6b43; }
+    .bad { color:#a33434; }
+    pre { background:#0f172a; color:#e5e7eb; padding:14px; border-radius:10px; overflow:auto; max-height:520px; font-size:12px; }
+    .meta { margin-top:8px; font-size:12px; color:#748095; }
+    @media (max-width:850px) { .grid,.cards { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>SPAD V4 Screening</h1>
+      <div class="muted">CSV-only input • Frozen SPAD V4 ML models • Runtime engineering limit</div>
+
+      <div class="grid">
+        <div class="field">
+          <label for="file">SPAD V4 input bundle</label>
+          <input id="file" type="file" accept=".zip,application/zip" />
+          <div class="help">Select <b>SPAD_V4_WEB_INPUT_V2.zip</b>. The server no longer requires MATLAB .mat files.</div>
+        </div>
+        <div class="field">
+          <label for="lotId">Lot ID</label>
+          <input id="lotId" type="text" value="TEST_LOT_001" />
+        </div>
+        <div class="field">
+          <label for="limit">RDS engineering limit (Ω)</label>
+          <input id="limit" type="number" min="0" step="0.01" value="8.0" />
+          <div class="help">Applied at runtime by Module C.</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="runBtn">Run Screening</button>
+        <button id="downloadBtn" class="secondary" disabled>Download JSON</button>
+        <span class="meta">API: same-origin /run-screening</span>
+      </div>
+      <div id="status" class="status"></div>
+    </header>
+
+    <section id="results" class="results">
+      <div id="cards" class="cards"></div>
+      <div class="panel">
+        <h2>Component Results</h2>
+        <table>
+          <thead><tr>
+            <th>Component</th><th>RDS0 Ω</th><th>RDS33 Ω</th><th>Pred. RDS100 Ω</th>
+            <th>Module A</th><th>First Stage</th><th>Max Instantaneous RDS Ω</th>
+            <th>Exceedances</th><th>Module C</th>
+          </tr></thead>
+          <tbody id="body"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>Raw API Response</h2>
+        <details><summary>Show JSON</summary><pre id="json"></pre></details>
+      </div>
+    </section>
+  </div>
+
+<script>
+  const API = '/run-screening';
+  let latest = null;
+  const $ = id => document.getElementById(id);
+  const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const n = (x, d=6) => Number.isFinite(Number(x)) ? Number(x).toFixed(d) : '—';
+
+  function status(msg, show=true) { $('status').textContent = msg; $('status').classList.toggle('show', show); }
+
+  function render(data) {
+    latest = data;
+    const rows = Array.isArray(data.records) ? data.records : [];
+    const a = rows.filter(r => r?.lotAnomaly?.Module_A_Anomaly === 'FLAGGED').length;
+    const c = rows.filter(r => r?.engineering?.rdson?.limitExceedanceFlag === 'FLAGGED').length;
+    $('cards').innerHTML = `
+      <div class="card"><div class="k">Lot ID</div><div class="v">${esc(data.lotId)}</div></div>
+      <div class="card"><div class="k">Components</div><div class="v">${rows.length}</div></div>
+      <div class="card"><div class="k">Module A flagged</div><div class="v">${a}</div></div>
+      <div class="card"><div class="k">Module C flagged</div><div class="v">${c}</div></div>`;
+
+    $('body').innerHTML = rows.map(r => {
+      const m = r.measurement || {}, p = r.prediction || {}, A = r.lotAnomaly || {}, E = r.engineering?.rdson || {};
+      const af = A.Module_A_Anomaly === 'FLAGGED', ef = E.limitExceedanceFlag === 'FLAGGED';
+      return `<tr>
+        <td><b>${esc(r.componentId)}</b></td>
+        <td>${n(m.RDS0)}</td><td>${n(m.RDS33)}</td><td>${n(p.Predicted_RDS100)}</td>
+        <td class="flag ${af ? 'bad' : 'ok'}">${esc(A.Module_A_Anomaly)}</td>
+        <td>${esc(A.First_Anomaly_Stage)}</td>
+        <td>${n(E.maxRDSInstantaneousOhm)}</td>
+        <td>${esc(E.limitExceedanceCount)}</td>
+        <td class="flag ${ef ? 'bad' : 'ok'}">${esc(E.limitExceedanceFlag)}</td>
+      </tr>`;
+    }).join('');
+    $('json').textContent = JSON.stringify(data, null, 2);
+    $('results').classList.add('show');
+    $('downloadBtn').disabled = false;
+  }
+
+  $('runBtn').addEventListener('click', async () => {
+    const file = $('file').files[0];
+    const lotId = $('lotId').value.trim();
+    const limit = Number($('limit').value);
+    if (!file) return status('Select SPAD_V4_WEB_INPUT_V2.zip first.');
+    if (!file.name.toLowerCase().endsWith('.zip')) return status('The input must be a ZIP file.');
+    if (!lotId) return status('Enter a Lot ID.');
+    if (!Number.isFinite(limit) || limit < 0) return status('Enter a valid non-negative RDS limit.');
+
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('lotId', lotId);
+    fd.append('engineeringLimits', JSON.stringify({ rdson: { limitValue: limit } }));
+
+    $('runBtn').disabled = true;
+    $('downloadBtn').disabled = true;
+    $('results').classList.remove('show');
+    const start = performance.now();
+    status(`Uploading ${file.name} (${(file.size / 1048576).toFixed(1)} MiB)...\nThe server is processing the transient evidence. Please wait.`);
+
+    const ticker = setInterval(() => {
+      const sec = ((performance.now() - start) / 1000).toFixed(0);
+      status(`Processing SPAD V4 screening...\nElapsed: ${sec} s\nPlease keep this page open.`);
+    }, 3000);
+
+    try {
+      const res = await fetch(API, { method:'POST', body:fd });
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); } catch { throw new Error(`Server returned HTTP ${res.status} with non-JSON content.`); }
+      if (!res.ok || data.success !== true) throw new Error(data?.detail?.message || data?.error || `Request failed (HTTP ${res.status}).`);
+      const sec = ((performance.now() - start) / 1000).toFixed(1);
+      status(`Screening completed successfully in ${sec} seconds.`);
+      render(data);
+    } catch (err) {
+      console.error(err);
+      status(`Screening failed:\n${err.message}`);
+    } finally {
+      clearInterval(ticker);
+      $('runBtn').disabled = false;
+    }
+  });
+
+  $('downloadBtn').addEventListener('click', () => {
+    if (!latest) return;
+    const blob = new Blob([JSON.stringify(latest, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${latest.lotId || 'SPAD_V4'}_screening_result.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+</script>
+</body>
+</html>

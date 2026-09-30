@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.responses import JSONResponse
 
 from inference import MODEL_PACKAGE, run_screening
@@ -12,6 +13,10 @@ app = FastAPI(
     title="SPAD V4 External ML Service",
     version="4.0.0",
 )
+
+@app.get("/")
+def serve_web_app():
+    return FileResponse("static/index.html")
 
 MAX_UPLOAD_BYTES = int(os.getenv("SPAD_MAX_UPLOAD_BYTES", str(250 * 1024 * 1024)))
 
