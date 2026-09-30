@@ -1,17 +1,14 @@
 from __future__ import annotations
 
+import io
 import json
 import pickle
-import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any
-import zipfile
 
 import numpy as np
 import pandas as pd
-import scipy.io
-from scipy.ndimage import median_filter
-
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PACKAGE_FILE = BASE_DIR / "models" / "SPAD_V4_Final_Model_Package.pkl"
@@ -28,7 +25,6 @@ if MODEL_PACKAGE.get("package_version") != "SPAD_V4":
 MODULE_A = MODEL_PACKAGE["module_a"]
 MODULE_B = MODEL_PACKAGE["module_b"]
 MODULE_C = MODEL_PACKAGE["module_c"]
-TARGET_CONDITION = tuple(MODEL_PACKAGE["metadata"]["operating_condition"])
 PROVISIONAL_MIN_CURRENT_A = float(MODULE_C["provisional_min_current_A"])
 
 
@@ -51,14 +47,16 @@ def validate_engineering_limits(engineering_limits: dict[str, Any]) -> dict[str,
         return {}
     if not isinstance(engineering_limits, dict):
         raise ValueError("engineeringLimits must be an object.")
-
     resolved: dict[str, dict[str, Any]] = {}
     for parameter, spec in engineering_limits.items():
         if not isinstance(spec, dict):
             raise ValueError(f"Engineering limit for '{parameter}' must be an object.")
         if "limitValue" not in spec:
             raise ValueError(f"Engineering limit for '{parameter}' is missing limitValue.")
-        value = _as_finite_float(spec["limitValue"], f"engineeringLimits.{parameter}.limitValue")
+        value = _as_finite_float(
+            spec["limitValue"],
+            f"engineeringLimits.{parameter}.limitValue",
+        )
         direction = str(spec.get("direction", "UPPER")).upper()
         if direction not in {"UPPER", "LOWER"}:
             raise ValueError(f"Unsupported limit direction for '{parameter}': {direction}")
@@ -70,49 +68,43 @@ def validate_engineering_limits(engineering_limits: dict[str, Any]) -> dict[str,
     return resolved
 
 
-def _safe_extract_zip(uploaded_bytes: bytes, destination: Path) -> None:
-    if len(uploaded_bytes) > 250 * 1024 * 1024:
-        raise ValueError("Uploaded dataset ZIP exceeds the 250 MB service limit.")
+def _open_bundle(dataset_bytes: bytes) -> tuple[io.BytesIO, zipfile.ZipFile, dict[str, str]]:
+    """Open the uploaded ZIP without decompressing the large evidence CSV into RAM."""
+    if not isinstance(dataset_bytes, (bytes, bytearray)) or not dataset_bytes:
+        raise ValueError("Dataset bundle is empty.")
+
+    buffer = io.BytesIO(dataset_bytes)
     try:
-        with zipfile.ZipFile(io_bytes := __import__("io").BytesIO(uploaded_bytes)) as zf:
-            bad = zf.testzip()
-            if bad:
-                raise ValueError(f"Corrupt ZIP member: {bad}")
-            for info in zf.infolist():
-                member = Path(info.filename)
-                if member.is_absolute() or ".." in member.parts:
-                    raise ValueError("Unsafe ZIP path detected.")
-                target = destination / member
-                target.parent.mkdir(parents=True, exist_ok=True)
-                if not info.is_dir():
-                    with zf.open(info, "r") as src, target.open("wb") as dst:
-                        dst.write(src.read())
+        zf = zipfile.ZipFile(buffer)
     except zipfile.BadZipFile as exc:
-        raise ValueError("Uploaded dataset must be a valid ZIP archive.") from exc
+        buffer.close()
+        raise ValueError("Uploaded file must be a valid ZIP bundle.") from exc
+
+    names = {Path(n).name: n for n in zf.namelist() if not n.endswith("/")}
+    if "component_data.csv" not in names:
+        zf.close()
+        buffer.close()
+        raise ValueError("Bundle is missing component_data.csv.")
+    if "transient_evidence.csv" not in names:
+        zf.close()
+        buffer.close()
+        raise ValueError("Bundle is missing transient_evidence.csv.")
+
+    return buffer, zf, names
 
 
-def _find_runlevel_csv(root: Path) -> Path:
-    candidates = list(root.rglob("MOSFET_199_200C_V2_Electrical_Features_RunLevel.csv"))
-    if not candidates:
-        candidates = list(root.rglob("*RunLevel.csv"))
-    if not candidates:
-        raise ValueError("Uploaded dataset ZIP does not contain a run-level CSV.")
-    return candidates[0]
-
-
-def _load_checkpoint_csv(root: Path) -> pd.DataFrame | None:
-    candidates = list(root.rglob("MOSFET_Normalized_4Checkpoints.csv"))
-    if not candidates:
-        return None
-    return pd.read_csv(candidates[0])
-
+def _read_component(zf: zipfile.ZipFile, component_name: str) -> pd.DataFrame:
+    """Read the small component CSV fully; the large transient CSV is streamed later."""
+    with zf.open(component_name) as f:
+        component = pd.read_csv(f)
+    return component
 
 def _build_checkpoint_values(runlevel: pd.DataFrame) -> pd.DataFrame:
     checkpoints = [
-        (1, 0.000000, "0h_equivalent"),
-        (2, 0.333333, "24h_equivalent"),
-        (3, 0.666667, "96h_equivalent"),
-        (4, 1.000000, "168h_equivalent"),
+        (1, 0.000000),
+        (2, 0.333333),
+        (3, 0.666667),
+        (4, 1.000000),
     ]
     rows: list[dict[str, Any]] = []
     for _, group in runlevel.groupby("Test_ID"):
@@ -124,34 +116,29 @@ def _build_checkpoint_values(runlevel: pd.DataFrame) -> pd.DataFrame:
         span = float(ages.max() - ages.min())
         if span <= 0:
             continue
-        for checkpoint_id, progress, label in checkpoints:
+        for checkpoint_id, progress in checkpoints:
             target_age = float(ages.min() + progress * span)
             nearest_idx = int(np.argmin(np.abs(ages - target_age)))
             rows.append({
                 "Test_ID": int(group["Test_ID"].iloc[0]),
                 "Checkpoint": checkpoint_id,
-                "Normalized_Progress": progress,
-                "Challenge_Equivalent_Label": label,
-                "Observed_Age_Min_Hours": float(ages.min()),
-                "Observed_Age_Max_Hours": float(ages.max()),
                 "Checkpoint_Age_Equivalent_Hours": target_age,
                 "RDSon_Interpolated_Ohm": float(np.interp(target_age, ages, rds)),
                 "Nearest_Actual_Run_ID": int(group.loc[nearest_idx, "Run_ID"]),
-                "Nearest_Actual_Age_Hours": float(ages[nearest_idx]),
-                "Number_of_Actual_Runs": int(len(group)),
             })
     if not rows:
-        raise ValueError("Could not construct the 4-checkpoint trajectory from the run-level data.")
+        raise ValueError("Could not construct the 4-checkpoint trajectory.")
     return pd.DataFrame(rows)
 
 
 def _build_wide(runlevel: pd.DataFrame, checkpoints_df: pd.DataFrame) -> pd.DataFrame:
     required_run = {
-        "Test_ID", "Run_ID", "Cumulative_Aging_Hours", "RDSon_Median_Ohm", "ID_ON_Median_A"
+        "Test_ID", "Run_ID", "Cumulative_Aging_Hours",
+        "RDSon_Median_Ohm", "ID_ON_Median_A",
     }
     missing = sorted(required_run - set(runlevel.columns))
     if missing:
-        raise ValueError("Run-level CSV is missing required columns: " + ", ".join(missing))
+        raise ValueError("Component CSV is missing required columns: " + ", ".join(missing))
 
     records: list[dict[str, Any]] = []
     for test_id, cp_group in checkpoints_df.groupby("Test_ID"):
@@ -167,8 +154,6 @@ def _build_wide(runlevel: pd.DataFrame, checkpoints_df: pd.DataFrame) -> pd.Data
             records.append({
                 "Test_ID": int(test_id),
                 "Checkpoint": int(cp["Checkpoint"]),
-                "Normalized_Progress": float(cp["Normalized_Progress"]),
-                "Checkpoint_Age_Equivalent_Hours": target_age,
                 "RDSon_Ohm": float(cp["RDSon_Interpolated_Ohm"]),
                 "ID_ON_A": float(np.interp(target_age, age, ids)),
             })
@@ -217,7 +202,6 @@ def _module_a_infer(wide: pd.DataFrame) -> None:
         wide[f"Module_A_IF_Score_{stage}"] = scores
         wide[f"Module_A_Novelty_Percentile_{stage}"] = novelty
         wide[f"Module_A_Flag_{stage}"] = flags
-
     stage_flag_cols = [f"Module_A_Flag_{s}" for s in (0, 33, 66, 100)]
     wide["Progressive_ML_Flag"] = np.where(
         wide[stage_flag_cols].eq("FLAGGED").any(axis=1), "FLAGGED", "NOT FLAGGED"
@@ -230,8 +214,8 @@ def _module_a_infer(wide: pd.DataFrame) -> None:
 
 def _module_b_infer(wide: pd.DataFrame) -> None:
     features = MODULE_B["features"]
-    if not all(c in wide.columns for c in features):
-        missing = [c for c in features if c not in wide.columns]
+    missing = [c for c in features if c not in wide.columns]
+    if missing:
         raise ValueError("Missing Module B features: " + ", ".join(missing))
     X = wide[features].to_numpy(dtype=float)
     if not np.isfinite(X).all():
@@ -247,285 +231,308 @@ def _module_b_infer(wide: pd.DataFrame) -> None:
     )
 
 
-def get_pwm_condition(p: Any) -> tuple[int, int, int, int, int, int] | None:
-    values = []
-    fields = ("lowTemp", "highTemp", "gateVoltage", "supplyVoltage", "switchingFrequency", "dutyCycle")
-    for field in fields:
-        value = getattr(p, field, np.nan)
-        try:
-            value = float(value)
-        except Exception:
-            value = np.nan
-        if not np.isfinite(value):
-            return None
-        values.append(int(round(value)))
-    return tuple(values)  # type: ignore[return-value]
+def _module_c_infer(
+    zf: zipfile.ZipFile,
+    evidence_name: str,
+    component_ids: pd.Series,
+    engineering_limits: dict[str, dict[str, Any]],
+    chunk_size: int = 100_000,
+) -> pd.DataFrame:
+    """
+    Evaluate the engineer-supplied RDS hard limit using exact sample-level CSV
+    evidence, while streaming the large transient CSV in chunks.
 
+    The input bundle can contain millions of transient samples. Only one
+    chunk plus compact per-component accumulators is held in memory.
+    """
+    component_ids = component_ids.astype(int)
 
-def build_pwm_timeline(measurement: Any) -> tuple[np.ndarray, list[tuple[int, int, int, int, int, int]]]:
-    if not hasattr(measurement, "pwmTempControllerState"):
-        return np.array([], dtype=float), []
-    pwm = np.atleast_1d(measurement.pwmTempControllerState)
-    rows = []
-    for p in pwm:
-        try:
-            t = float(getattr(p, "timeEpoch"))
-            condition = get_pwm_condition(p)
-            if np.isfinite(t) and condition is not None:
-                rows.append((t, condition))
-        except Exception:
-            continue
-    rows.sort(key=lambda x: x[0])
-    if not rows:
-        return np.array([], dtype=float), []
-    return np.array([x[0] for x in rows], dtype=float), [x[1] for x in rows]
-
-
-def detect_on_window(gate: np.ndarray) -> tuple[int, int] | None:
-    gate = np.asarray(gate, dtype=float).squeeze()
-    valid = np.isfinite(gate)
-    if valid.sum() < 10:
-        return None
-    gate_clean = gate.copy()
-    gate_clean[~valid] = np.nanmedian(gate_clean[valid])
-    gate_filtered = median_filter(gate_clean, size=5, mode="nearest")
-    low = np.percentile(gate_filtered, 5)
-    high = np.percentile(gate_filtered, 95)
-    amplitude = high - low
-    if amplitude <= 0:
-        return None
-    on_threshold = low + 0.70 * amplitude
-    off_threshold = low + 0.30 * amplitude
-    state = np.zeros(len(gate_filtered), dtype=bool)
-    is_on = False
-    for i, value in enumerate(gate_filtered):
-        if not is_on and value >= on_threshold:
-            is_on = True
-        elif is_on and value <= off_threshold:
-            is_on = False
-        state[i] = is_on
-    changes = np.diff(np.concatenate(([False], state, [False])).astype(int))
-    starts = np.where(changes == 1)[0]
-    ends = np.where(changes == -1)[0]
-    regions = [(int(s), int(e)) for s, e in zip(starts, ends) if e > s]
-    return max(regions, key=lambda x: x[1] - x[0]) if regions else None
-
-
-def scan_run_hard_limit(mat_file: Path, engineering_limit_ohm: float) -> dict[str, Any]:
-    data = scipy.io.loadmat(mat_file, struct_as_record=False, squeeze_me=True)
-    measurement = data["measurement"]
-    pwm_times, pwm_conditions = build_pwm_timeline(measurement)
-    transients = np.atleast_1d(measurement.transient)
-
-    max_rds = -np.inf
-    max_transient = np.nan
-    max_time_us = np.nan
-    exceedance_count = 0
-    first_exceedance_time_us = np.nan
-    first_exceedance_transient_id = np.nan
-    valid_samples = 0
-    target_transients = 0
-
-    for transient_id, tr in enumerate(transients):
-        try:
-            transient_time = float(getattr(tr, "timeEpoch"))
-        except Exception:
-            continue
-        if not np.isfinite(transient_time) or len(pwm_times) == 0:
-            continue
-        pwm_idx = np.searchsorted(pwm_times, transient_time, side="right") - 1
-        if pwm_idx < 0 or pwm_conditions[pwm_idx] != TARGET_CONDITION:
-            continue
-        target_transients += 1
-
-        td = tr.timeDomain
-        gate = np.asarray(td.gateSignalVoltage, dtype=float).squeeze()
-        vds = np.asarray(td.drainSourceVoltage, dtype=float).squeeze()
-        ids = np.asarray(td.drainCurrent, dtype=float).squeeze()
-        dt = float(np.asarray(td.dt).squeeze())
-        n = min(len(gate), len(vds), len(ids))
-        gate, vds, ids = gate[:n], vds[:n], ids[:n]
-        detected = detect_on_window(gate)
-        if detected is None:
-            continue
-        start, end = detected
-        on_vds = vds[start:end]
-        on_ids = ids[start:end]
-        idx = np.arange(start, end)
-        time_us = idx * dt * 1e6
-        valid = np.isfinite(on_vds) & np.isfinite(on_ids) & (np.abs(on_ids) >= PROVISIONAL_MIN_CURRENT_A)
-        if not np.any(valid):
-            continue
-        rds = on_vds[valid] / on_ids[valid]
-        times = time_us[valid]
-        valid_rds = np.isfinite(rds) & (rds > 0)
-        rds, times = rds[valid_rds], times[valid_rds]
-        if len(rds) == 0:
-            continue
-        valid_samples += len(rds)
-        local_max_idx = int(np.argmax(rds))
-        local_max = float(rds[local_max_idx])
-        if local_max > max_rds:
-            max_rds = local_max
-            max_transient = int(transient_id)
-            max_time_us = float(times[local_max_idx])
-        exceed = rds > engineering_limit_ohm
-        count = int(np.sum(exceed))
-        exceedance_count += count
-        if count > 0:
-            first_idx = int(np.where(exceed)[0][0])
-            t_first = float(times[first_idx])
-            if np.isnan(first_exceedance_time_us) or t_first < first_exceedance_time_us:
-                first_exceedance_time_us = t_first
-                first_exceedance_transient_id = int(transient_id)
-
-    if target_transients == 0:
-        raise ValueError("No target-condition transients were found in the uploaded run.")
-
-    return {
-        "Engineering_Limit_Ohm": float(engineering_limit_ohm),
-        "Max_RDS_Instantaneous_Ohm": float(max_rds) if np.isfinite(max_rds) else np.nan,
-        "Max_RDS_Evidence_Transient_ID": max_transient,
-        "Max_RDS_Evidence_Time_us": max_time_us,
-        "Limit_Exceedance_Count": int(exceedance_count),
-        "First_Limit_Exceedance_Time_us": first_exceedance_time_us,
-        "First_Limit_Exceedance_Transient_ID": first_exceedance_transient_id,
-        "Limit_Exceedance_Margin_Ohm": float(max_rds - engineering_limit_ohm) if np.isfinite(max_rds) else np.nan,
-        "Limit_Exceedance_Flag": "FLAGGED" if exceedance_count > 0 else "NOT FLAGGED",
-        "Valid_RDS_Sample_Count": int(valid_samples),
-        "Target_Condition_Transient_Count": int(target_transients),
-        "Provisional_Min_Current_A": PROVISIONAL_MIN_CURRENT_A,
-    }
-
-
-def _module_c_infer(root: Path, wide: pd.DataFrame, engineering_limits: dict[str, dict[str, Any]]) -> pd.DataFrame:
     if "rdson" not in engineering_limits:
-        # Current Python pipeline has no other supported measured parameter.
-        out = pd.DataFrame({"Test_ID": wide["Test_ID"].astype(int)})
-        out["Limit_Scan_Status"] = "NOT_EVALUATED"
-        out["Limit_Scan_Reason"] = "No rdson engineering limit was supplied."
-        out["Engineering_Limit_Ohm"] = np.nan
-        out["Provisional_Min_Current_A"] = PROVISIONAL_MIN_CURRENT_A
-        out["Limit_Exceedance_Flag"] = "NOT_EVALUATED"
-        out["Max_RDS_Instantaneous_Ohm"] = np.nan
-        out["Limit_Exceedance_Count"] = 0
-        return out
+        return pd.DataFrame({
+            "Test_ID": component_ids,
+            "Limit_Scan_Status": "NOT_EVALUATED",
+            "Limit_Scan_Reason": "No rdson engineering limit was supplied.",
+            "Engineering_Limit_Ohm": np.nan,
+            "Max_RDS_Instantaneous_Ohm": np.nan,
+            "Limit_Exceedance_Flag": "NOT_EVALUATED",
+            "Limit_Exceedance_Count": 0,
+            "Limit_Exceedance_Transient_Count": 0,
+            "Provisional_Min_Current_A": PROVISIONAL_MIN_CURRENT_A,
+        })
 
     limit = engineering_limits["rdson"]
     engineering_limit_ohm = float(limit["limitValue"])
+    direction = str(limit.get("direction", "UPPER")).upper()
+    if direction != "UPPER":
+        raise ValueError("Compact CSV Module C currently supports direction=UPPER only.")
+
+    required = {
+        "Test_ID", "Run_ID", "Transient_ID", "Time_us", "RDS_Ohm",
+        "Provisional_Min_Current_A", "Data_Format_Version",
+    }
+    available = set(pd.read_csv(zf.open(evidence_name), nrows=0).columns)
+    missing = sorted(required - available)
+    if missing:
+        raise ValueError(
+            "transient_evidence.csv is missing columns: " + ", ".join(missing)
+        )
+
+    test_ids = [int(v) for v in component_ids.tolist()]
+    test_id_set = set(test_ids)
+    stats: dict[int, dict[str, Any]] = {
+        test_id: {
+            "valid_count": 0,
+            "exceed_count": 0,
+            "exceed_transients": set(),
+            "target_transients": set(),
+            "run_max": {},
+            "max_rds": -np.inf,
+            "max_transient_id": None,
+            "max_time_us": np.nan,
+            "first_exceed_time_us": np.nan,
+            "first_exceed_transient_id": None,
+            "seen_any": False,
+            "format_versions": set(),
+        }
+        for test_id in test_ids
+    }
+
+    usecols = [
+        "Test_ID", "Run_ID", "Transient_ID", "Time_us", "RDS_Ohm",
+        "Data_Format_Version",
+    ]
+
+    with zf.open(evidence_name) as raw:
+        reader = pd.read_csv(raw, usecols=usecols, chunksize=chunk_size)
+        for chunk in reader:
+            if chunk.empty:
+                continue
+
+            chunk["Test_ID"] = pd.to_numeric(chunk["Test_ID"], errors="raise").astype(int)
+            chunk["Run_ID"] = pd.to_numeric(chunk["Run_ID"], errors="raise").astype(int)
+            chunk["Transient_ID"] = pd.to_numeric(chunk["Transient_ID"], errors="raise").astype(int)
+            chunk["Time_us"] = pd.to_numeric(chunk["Time_us"], errors="raise")
+            chunk["RDS_Ohm"] = pd.to_numeric(chunk["RDS_Ohm"], errors="raise")
+
+            versions = set(chunk["Data_Format_Version"].astype(str).str.strip())
+            for test_id in test_id_set:
+                sub = chunk[chunk["Test_ID"] == test_id]
+                if sub.empty:
+                    continue
+
+                st = stats[test_id]
+                st["seen_any"] = True
+                st["format_versions"].update(versions)
+
+                rds = sub["RDS_Ohm"].to_numpy(dtype=float)
+                finite = np.isfinite(rds)
+                if not finite.all():
+                    raise ValueError(f"Non-finite RDS_Ohm evidence for Test_ID {test_id}.")
+                times = sub["Time_us"].to_numpy(dtype=float)
+                if not np.isfinite(times).all():
+                    raise ValueError(f"Non-finite Time_us evidence for Test_ID {test_id}.")
+
+                st["valid_count"] += int(len(sub))
+                st["target_transients"].update(sub["Transient_ID"].astype(int).tolist())
+
+                # Maximum RDS evidence: preserve first row in file order on ties.
+                local_max_pos = int(np.argmax(rds))
+                local_max = float(rds[local_max_pos])
+                if local_max > st["max_rds"]:
+                    row = sub.iloc[local_max_pos]
+                    st["max_rds"] = local_max
+                    st["max_transient_id"] = int(row["Transient_ID"])
+                    st["max_time_us"] = float(row["Time_us"])
+
+                exceed_mask = rds > engineering_limit_ohm
+                if exceed_mask.any():
+                    exceed_sub = sub.iloc[np.flatnonzero(exceed_mask)]
+                    st["exceed_count"] += int(exceed_mask.sum())
+                    st["exceed_transients"].update(
+                        exceed_sub["Transient_ID"].astype(int).tolist()
+                    )
+                    # Current V2 semantics select the earliest Time_us, then
+                    # retain the first row encountered on an exact tie.
+                    local_first_pos = int(np.argmin(exceed_sub["Time_us"].to_numpy(dtype=float)))
+                    local_first = exceed_sub.iloc[local_first_pos]
+                    local_first_time = float(local_first["Time_us"])
+                    if (
+                        pd.isna(st["first_exceed_time_us"])
+                        or local_first_time < float(st["first_exceed_time_us"])
+                    ):
+                        st["first_exceed_time_us"] = local_first_time
+                        st["first_exceed_transient_id"] = int(local_first["Transient_ID"])
+
+                # Build exact run-level max values without retaining raw samples.
+                run_max_series = sub.groupby("Run_ID")["RDS_Ohm"].max()
+                for run_id, run_max in run_max_series.items():
+                    run_id = int(run_id)
+                    run_max = float(run_max)
+                    prior = st["run_max"].get(run_id, -np.inf)
+                    if run_max > prior:
+                        st["run_max"][run_id] = run_max
+
+            if versions - {"SPAD_V4_WEB_CSV_V2"}:
+                raise ValueError("Unsupported transient CSV Data_Format_Version.")
 
     records = []
-    for _, row in wide[["Test_ID"]].drop_duplicates().iterrows():
-        test_id = int(row["Test_ID"])
-        mat_files = sorted(root.rglob(f"Test_{test_id}_run_*.mat"))
-        if not mat_files:
-            raise ValueError(f"No raw MAT files found for Test_ID {test_id}.")
+    for test_id in test_ids:
+        st = stats[test_id]
+        if not st["seen_any"] or st["valid_count"] == 0:
+            raise ValueError(f"No transient evidence for Test_ID {test_id}.")
+        if st["format_versions"] != {"SPAD_V4_WEB_CSV_V2"}:
+            raise ValueError(
+                f"Unsupported transient CSV Data_Format_Version for Test_ID {test_id}."
+            )
 
-        per_run = []
-        for mat_file in mat_files:
-            # Preserve existing V4 file naming and condition-selection behavior.
-            # Run ID is taken from the filename for reporting only.
-            result = scan_run_hard_limit(mat_file, engineering_limit_ohm)
-            run_id = int(mat_file.stem.rsplit("_", 1)[-1])
-            per_run.append({"Run_ID": run_id, **result})
+        limit_exceedance_runs = sum(
+            1 for run_max in st["run_max"].values() if run_max > engineering_limit_ohm
+        )
 
-        df = pd.DataFrame(per_run)
-        max_idx = int(df["Max_RDS_Instantaneous_Ohm"].idxmax())
-        max_row = df.loc[max_idx]
         records.append({
-            "Test_ID": test_id,
+            "Test_ID": int(test_id),
             "Engineering_Limit_Ohm": engineering_limit_ohm,
-            "Max_RDS_Instantaneous_Ohm": float(df["Max_RDS_Instantaneous_Ohm"].max()),
-            "Limit_Exceedance_Count": int(df["Limit_Exceedance_Count"].sum()),
-            "Limit_Exceedance_Runs": int((df["Limit_Exceedance_Flag"] == "FLAGGED").sum()),
-            "Valid_RDS_Sample_Count": int(df["Valid_RDS_Sample_Count"].sum()),
-            "Target_Condition_Transient_Count": int(df["Target_Condition_Transient_Count"].sum()),
-            "Limit_Exceedance_Margin_Ohm": float(df["Max_RDS_Instantaneous_Ohm"].max() - engineering_limit_ohm),
-            "Limit_Exceedance_Flag": "FLAGGED" if int(df["Limit_Exceedance_Count"].sum()) > 0 else "NOT FLAGGED",
+            "Max_RDS_Instantaneous_Ohm": float(st["max_rds"]),
+            "Limit_Exceedance_Count": int(st["exceed_count"]),
+            "Limit_Exceedance_Transient_Count": int(len(st["exceed_transients"])),
+            "Limit_Exceedance_Runs": int(limit_exceedance_runs),
+            "Limit_Exceedance_Flag": (
+                "FLAGGED" if st["exceed_count"] > 0 else "NOT FLAGGED"
+            ),
+            "Limit_Exceedance_Margin_Ohm": float(
+                st["max_rds"] - engineering_limit_ohm
+            ),
+            "First_Limit_Exceedance_Time_us": (
+                float(st["first_exceed_time_us"])
+                if not pd.isna(st["first_exceed_time_us"]) else np.nan
+            ),
+            "First_Limit_Exceedance_Transient_ID": (
+                int(st["first_exceed_transient_id"])
+                if st["first_exceed_transient_id"] is not None else np.nan
+            ),
+            "Valid_RDS_Sample_Count": int(st["valid_count"]),
+            "Target_Condition_Transient_Count": int(len(st["target_transients"])),
             "Limit_Scan_Status": "EVALUATED",
-            "Max_RDS_Evidence_Transient_ID": max_row["Max_RDS_Evidence_Transient_ID"],
-            "Max_RDS_Evidence_Time_us": max_row["Max_RDS_Evidence_Time_us"],
+            "Limit_Scan_Reason": (
+                "Exact sample-level CSV evidence streamed in chunks; no raw MAT files required."
+            ),
+            "Max_RDS_Evidence_Transient_ID": (
+                int(st["max_transient_id"]) if st["max_transient_id"] is not None else np.nan
+            ),
+            "Max_RDS_Evidence_Time_us": float(st["max_time_us"]),
             "Provisional_Min_Current_A": PROVISIONAL_MIN_CURRENT_A,
         })
 
     return pd.DataFrame(records)
 
-
-def run_screening(dataset_bytes: bytes, lot_id: str, engineering_limits: dict[str, Any], file_name: str) -> dict[str, Any]:
+def run_screening(
+    dataset_bytes: bytes,
+    lot_id: str,
+    engineering_limits: dict[str, Any],
+    file_name: str,
+) -> dict[str, Any]:
     if not lot_id or not str(lot_id).strip():
         raise ValueError("lotId is required for live screening requests.")
+
     limits = validate_engineering_limits(engineering_limits)
+    buffer, zf, names = _open_bundle(dataset_bytes)
+    try:
+        component = _read_component(zf, names["component_data.csv"])
 
-    with tempfile.TemporaryDirectory(prefix="spad_") as tmp:
-        root = Path(tmp)
-        _safe_extract_zip(dataset_bytes, root)
+        required_component = {
+            "Test_ID", "Run_ID", "Cumulative_Aging_Hours",
+            "RDSon_Median_Ohm", "ID_ON_Median_A", "Data_Format_Version",
+        }
+        missing = sorted(required_component - set(component.columns))
+        if missing:
+            raise ValueError(
+                "component_data.csv is missing required columns: " + ", ".join(missing)
+            )
 
-        runlevel_file = _find_runlevel_csv(root)
-        runlevel = pd.read_csv(runlevel_file)
-        checkpoints_df = _load_checkpoint_csv(root)
-        if checkpoints_df is None:
-            checkpoints_df = _build_checkpoint_values(runlevel)
+        if component.empty:
+            raise ValueError("component_data.csv contains no rows.")
+        if set(component["Data_Format_Version"].astype(str).str.strip()) != {
+            "SPAD_V4_WEB_CSV_V2"
+        }:
+            raise ValueError("Unsupported component CSV Data_Format_Version.")
 
-        wide = _build_wide(runlevel, checkpoints_df)
+        component["Test_ID"] = pd.to_numeric(
+            component["Test_ID"], errors="raise"
+        ).astype(int)
+        component["Run_ID"] = pd.to_numeric(
+            component["Run_ID"], errors="raise"
+        ).astype(int)
+        duplicate = component.duplicated(["Test_ID", "Run_ID"], keep=False)
+        if duplicate.any():
+            raise ValueError("component_data.csv contains duplicate Test_ID/Run_ID rows.")
+
+        checkpoints_df = _build_checkpoint_values(component)
+        wide = _build_wide(component, checkpoints_df)
         _module_a_infer(wide)
         _module_b_infer(wide)
-        component_limit = _module_c_infer(root, wide, limits)
+        component_limit = _module_c_infer(
+            zf, names["transient_evidence.csv"], wide["Test_ID"], limits
+        )
+    finally:
+        zf.close()
+        buffer.close()
 
-        result = wide.merge(component_limit, on="Test_ID", how="left")
-        result["Component_ID"] = result["Test_ID"].map(canonical_component_id)
+    result = wide.merge(component_limit, on="Test_ID", how="left")
+    result["Component_ID"] = result["Test_ID"].map(canonical_component_id)
 
-        records = []
-        for _, row in result.sort_values("Test_ID").iterrows():
-            records.append({
-                "componentId": row["Component_ID"],
-                "lotId": str(lot_id),
-                "measurement": {
-                    "RDS0": float(row["RDS0"]),
-                    "RDS33": float(row["RDS33"]),
-                    "Delta_RDS_0_33": float(row["Delta_RDS_0_33"]),
-                },
-                "prediction": {
-                    "Predicted_RDS100": float(row["Predicted_RDS100"]),
-                    "Forecast_Residual": float(row["Forecast_Residual"]),
-                    "Absolute_Forecast_Error": float(row["Absolute_Forecast_Error"]),
-                    "Relative_Error_Percent": float(row["Relative_Error_Percent"]),
-                },
-                "lotAnomaly": {
-                    "Module_A_IF_Score": float(row["Module_A_IF_Score_33"]),
-                    "Module_A_Novelty_Percentile": float(row["Module_A_Novelty_Percentile_33"]),
-                    "Module_A_Anomaly": str(row["Module_A_Flag_33"]),
-                    "Module_A_IF_Scores": {
-                        "0": float(row["Module_A_IF_Score_0"]),
-                        "33": float(row["Module_A_IF_Score_33"]),
-                        "66": float(row["Module_A_IF_Score_66"]),
-                        "100": float(row["Module_A_IF_Score_100"]),
-                    },
-                    "Module_A_Novelty_Percentiles": {
-                        "0": float(row["Module_A_Novelty_Percentile_0"]),
-                        "33": float(row["Module_A_Novelty_Percentile_33"]),
-                        "66": float(row["Module_A_Novelty_Percentile_66"]),
-                        "100": float(row["Module_A_Novelty_Percentile_100"]),
-                    },
-                    "First_Anomaly_Stage": None if pd.isna(row["First_Anomaly_Stage"]) else int(row["First_Anomaly_Stage"]),
-                },
-                "engineering": {
-                    "rdson": {
-                        "limitValue": None if pd.isna(row.get("Engineering_Limit_Ohm", np.nan)) else float(row["Engineering_Limit_Ohm"]),
-                        "unit": limits.get("rdson", {}).get("unit"),
-                        "direction": limits.get("rdson", {}).get("direction", "UPPER"),
-                        "maxRDSInstantaneousOhm": None if pd.isna(row.get("Max_RDS_Instantaneous_Ohm", np.nan)) else float(row["Max_RDS_Instantaneous_Ohm"]),
-                        "limitExceedanceCount": int(row.get("Limit_Exceedance_Count", 0)),
-                        "limitExceedanceFlag": str(row.get("Limit_Exceedance_Flag", "NOT_EVALUATED")),
-                        "evidenceTransientId": None if pd.isna(row.get("Max_RDS_Evidence_Transient_ID", np.nan)) else int(row["Max_RDS_Evidence_Transient_ID"]),
-                        "evidenceTimeUs": None if pd.isna(row.get("Max_RDS_Evidence_Time_us", np.nan)) else float(row["Max_RDS_Evidence_Time_us"]),
-                    }
-                },
-            })
-
-        return {
-            "success": True,
+    records = []
+    for _, row in result.sort_values("Test_ID").iterrows():
+        records.append({
+            "componentId": row["Component_ID"],
             "lotId": str(lot_id),
-            "fileName": file_name,
-            "modelPackage": MODEL_PACKAGE_FILE.name,
-            "records": records,
-        }
+            "measurement": {
+                "RDS0": float(row["RDS0"]),
+                "RDS33": float(row["RDS33"]),
+                "Delta_RDS_0_33": float(row["Delta_RDS_0_33"]),
+            },
+            "prediction": {
+                "Predicted_RDS100": float(row["Predicted_RDS100"]),
+                "Forecast_Residual": float(row["Forecast_Residual"]),
+                "Absolute_Forecast_Error": float(row["Absolute_Forecast_Error"]),
+                "Relative_Error_Percent": float(row["Relative_Error_Percent"]),
+            },
+            "lotAnomaly": {
+                "Module_A_IF_Score": float(row["Module_A_IF_Score_33"]),
+                "Module_A_Novelty_Percentile": float(row["Module_A_Novelty_Percentile_33"]),
+                "Module_A_Anomaly": str(row["Module_A_Flag_33"]),
+                "Module_A_IF_Scores": {
+                    "0": float(row["Module_A_IF_Score_0"]),
+                    "33": float(row["Module_A_IF_Score_33"]),
+                    "66": float(row["Module_A_IF_Score_66"]),
+                    "100": float(row["Module_A_IF_Score_100"]),
+                },
+                "Module_A_Novelty_Percentiles": {
+                    "0": float(row["Module_A_Novelty_Percentile_0"]),
+                    "33": float(row["Module_A_Novelty_Percentile_33"]),
+                    "66": float(row["Module_A_Novelty_Percentile_66"]),
+                    "100": float(row["Module_A_Novelty_Percentile_100"]),
+                },
+                "First_Anomaly_Stage": None if pd.isna(row["First_Anomaly_Stage"]) else int(row["First_Anomaly_Stage"]),
+            },
+            "engineering": {
+                "rdson": {
+                    "limitValue": None if pd.isna(row.get("Engineering_Limit_Ohm", np.nan)) else float(row["Engineering_Limit_Ohm"]),
+                    "unit": limits.get("rdson", {}).get("unit"),
+                    "direction": limits.get("rdson", {}).get("direction", "UPPER"),
+                    "maxRDSInstantaneousOhm": None if pd.isna(row.get("Max_RDS_Instantaneous_Ohm", np.nan)) else float(row["Max_RDS_Instantaneous_Ohm"]),
+                    "limitExceedanceCount": int(row.get("Limit_Exceedance_Transient_Count", 0)),
+                    "limitExceedanceFlag": str(row.get("Limit_Exceedance_Flag", "NOT_EVALUATED")),
+                    "evidenceTransientId": None if pd.isna(row.get("Max_RDS_Evidence_Transient_ID", np.nan)) else int(row["Max_RDS_Evidence_Transient_ID"]),
+                    "evidenceTimeUs": None if pd.isna(row.get("Max_RDS_Evidence_Time_us", np.nan)) else float(row["Max_RDS_Evidence_Time_us"]),
+                }
+            },
+        })
+
+    return {
+        "success": True,
+        "lotId": str(lot_id),
+        "fileName": file_name,
+        "modelPackage": MODEL_PACKAGE_FILE.name,
+        "dataFormatVersion": "SPAD_V4_WEB_CSV_V2",
+        "records": records,
+    }
