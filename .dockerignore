@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+test_r1.py
+AUDIT_R1.md
+DEPLOYMENT_RUNBOOK.md
+NODE_REVISED_CONTRACT.md
+test_api_r1.py
+SPAD_V4_WEB_INPUT_V2.zip

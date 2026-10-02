@@ -1,0 +1,13 @@
+PASS clean mini bundle
+PASS file-object mode
+PASS fractional component Test_ID: Test_ID must contain integer-valued IDs; fractional IDs are invalid.
+PASS orphan Run_ID: transient_evidence.csv contains Test_ID/Run_ID pairs absent from component_data.csv: [(6, 99)]
+PASS unknown Test_ID: transient_evidence.csv contains Test_ID values absent from component_data.csv: [99]
+PASS missing evidence pair: transient_evidence.csv is missing evidence for component Test_ID/Run_ID pairs: [(6, 2)]
+PASS bad Target_Condition: component_data.csv Target_Condition does not match the frozen model condition.
+PASS nested path: Bundle must contain exactly top-level component_data.csv and transient_evidence.csv.
+PASS duplicate member name: Bundle must contain exactly component_data.csv and transient_evidence.csv.
+PASS lower RDS direction
+PASS no rdson limit
+PASS full V2 regression: 15 devices, 3,656,923 samples, 6,900 transient groups
+ALL R1 TESTS PASSED
