@@ -137,7 +137,7 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/run-screening")
-async def screening(
+def screening(
     file: UploadFile = File(..., description="ZIP containing exactly component_data.csv and transient_evidence.csv."),
     lotId: str = Form(...),
     engineeringLimits: str = Form("{}"),
@@ -145,7 +145,7 @@ async def screening(
 ):
     _check_api_key(x_spad_api_key)
     try:
-        await file.seek(0)
+       
         try:
             file.file.seek(0, 2)
             file_size = int(file.file.tell())
